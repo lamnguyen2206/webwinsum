@@ -1,0 +1,350 @@
+<?php
+
+declare(strict_types=1);
+
+if (session_status() !== PHP_SESSION_ACTIVE) {
+    session_start();
+}
+
+/**
+ * php tests/run.php
+ * Uses database winsumwebfinal_test. Creates and imports it when missing.
+ */
+
+$root = dirname(__DIR__);
+$testDb = 'winsumwebfinal_test';
+putenv('WINSUM_DB_NAME=' . $testDb);
+
+$config = require $root . '/config/local.example.php';
+if (is_file($root . '/config/local.dev.php')) {
+    $config = require $root . '/config/local.dev.php';
+} elseif (is_file($root . '/config/local.php')) {
+    $localConfig = require $root . '/config/local.php';
+    $localUser = (string) ($localConfig['db']['user'] ?? '');
+    $localName = (string) ($localConfig['db']['name'] ?? '');
+    $isHosting = preg_match('/^u\d+_/', $localUser) === 1 || preg_match('/^u\d+_/', $localName) === 1;
+    if (is_array($localConfig) && !$isHosting) {
+        $config = $localConfig;
+    }
+}
+$db = $config['db'];
+$server = new mysqli((string) $db['host'], (string) $db['user'], (string) $db['pass']);
+if ($server->connect_error) {
+    fwrite(STDERR, $server->connect_error . "\n");
+    exit(1);
+}
+$server->set_charset('utf8mb4');
+$server->query('CREATE DATABASE IF NOT EXISTS `' . $testDb . '` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci');
+
+$check = new mysqli((string) $db['host'], (string) $db['user'], (string) $db['pass'], $testDb);
+$exists = $check->query("SHOW TABLES LIKE 'products'");
+if (!$exists || $exists->num_rows === 0) {
+    $sql = file_get_contents($root . '/winsumwebfinal.sql');
+    if ($sql === false || !$check->multi_query($sql)) {
+        fwrite(STDERR, 'Import failed: ' . $check->error . "\n");
+        exit(1);
+    }
+    while ($check->more_results() && $check->next_result()) {
+    }
+}
+$check->close();
+
+passthru('WINSUM_DB_NAME=' . escapeshellarg($testDb) . ' php ' . escapeshellarg($root . '/scripts/migrate.php'), $migrateCode);
+if ($migrateCode !== 0) {
+    exit($migrateCode);
+}
+
+require_once $root . '/config/database.php';
+require_once $root . '/includes/helpers.php';
+require_once $root . '/includes/order-repository.php';
+require_once $root . '/includes/coupon-repository.php';
+require_once $root . '/includes/customer-auth.php';
+require_once $root . '/includes/admin-auth.php';
+require_once $root . '/includes/cart-store.php';
+require_once $root . '/includes/payment-webhook.php';
+
+$failures = 0;
+
+function check(bool $ok, string $message): void
+{
+    global $failures;
+    if ($ok) {
+        echo "PASS {$message}\n";
+        return;
+    }
+    $failures++;
+    echo "FAIL {$message}\n";
+}
+
+function testOrderFlow(mysqli $conn): void
+{
+    $product = $conn->query('SELECT p.id, p.base_price, ii.quantity_on_hand
+                             FROM products p
+                             INNER JOIN inventory_items ii ON ii.product_id = p.id
+                             WHERE p.is_active = 1 AND p.stock_status = \'in_stock\' AND ii.quantity_on_hand > 0
+                             ORDER BY p.id ASC LIMIT 1')->fetch_assoc();
+    $shipping = $conn->query('SELECT id, fee FROM shipping_methods WHERE is_active = 1 ORDER BY id ASC LIMIT 1')->fetch_assoc();
+    $payment = $conn->query('SELECT id FROM payment_methods WHERE is_active = 1 ORDER BY id ASC LIMIT 1')->fetch_assoc();
+    if (!$product || !$shipping || !$payment) {
+        check(false, 'order flow fixtures');
+        return;
+    }
+    $before = (int) $product['quantity_on_hand'];
+    $productId = (int) $product['id'];
+    $price = (int) round((float) $product['base_price']);
+    $code = orderCreateFromCheckout(
+        $conn,
+        [
+            'name' => 'Test Buyer',
+            'phone' => '0900000001',
+            'email' => 'buyer@example.com',
+            'address' => 'Ha Noi',
+            'note' => '',
+        ],
+        [[
+            'product_id' => $productId,
+            'sku' => 'TEST',
+            'name' => 'Test lamp',
+            'image' => 'assets/images/blog_1.png',
+            'price' => $price,
+            'qty' => 1,
+        ]],
+        ['subtotal' => $price, 'shipping' => (int) $shipping['fee'], 'discount' => 0, 'total' => $price + (int) $shipping['fee']],
+        null,
+        null,
+        (int) $shipping['id'],
+        (int) $payment['id'],
+        null
+    );
+    $order = $conn->query("SELECT id, status, fulfillment_status FROM orders WHERE order_code = '" . $conn->real_escape_string($code) . "'")->fetch_assoc();
+    $afterCreate = (int) $conn->query('SELECT quantity_on_hand FROM inventory_items WHERE product_id = ' . $productId)->fetch_assoc()['quantity_on_hand'];
+    check($order && $order['status'] === 'pending' && $order['fulfillment_status'] === 'pending', 'new order is pending');
+    check($afterCreate === $before, 'inventory unchanged until shipped');
+
+    $orderId = (int) $order['id'];
+    check(orderUpdateFulfillmentStatus($conn, $orderId, 'processing'), 'admin confirms order');
+    check(orderUpdateFulfillmentStatus($conn, $orderId, 'shipped'), 'admin ships order');
+    $afterShip = (int) $conn->query('SELECT quantity_on_hand FROM inventory_items WHERE product_id = ' . $productId)->fetch_assoc()['quantity_on_hand'];
+    $shipped = $conn->query('SELECT status FROM orders WHERE id = ' . $orderId)->fetch_assoc();
+    check($shipped && $shipped['status'] === 'shipped' && $afterShip === $before - 1, 'shipping deducts one unit');
+}
+
+function testCouponExhausted(mysqli $conn): void
+{
+    $coupon = $conn->query('SELECT id, code FROM coupons WHERE is_active = 1 AND code = \'FREESHIP\' LIMIT 1')->fetch_assoc();
+    if (!$coupon) {
+        check(false, 'coupon fixture');
+        return;
+    }
+    $couponId = (int) $coupon['id'];
+    $conn->begin_transaction();
+    $conn->query('UPDATE coupons SET total_usage_limit = 0 WHERE id = ' . $couponId);
+    $result = couponValidate($conn, (string) $coupon['code'], 10000000, null, '0900000099');
+    $conn->rollback();
+    check($result['ok'] === false, 'exhausted coupon is rejected');
+}
+
+function testOrderOwnership(mysqli $conn): void
+{
+    $order = $conn->query('SELECT order_code, customer_id FROM orders WHERE customer_id IS NOT NULL ORDER BY id ASC LIMIT 1')->fetch_assoc();
+    $other = $conn->query('SELECT id FROM customers WHERE id <> ' . (int) ($order['customer_id'] ?? 0) . ' ORDER BY id ASC LIMIT 1')->fetch_assoc();
+    if (!$order || !$other) {
+        check(false, 'ownership fixtures');
+        return;
+    }
+    $found = orderGetCustomerOrderDetailByCode($conn, (int) $other['id'], (string) $order['order_code']);
+    check($found === null, 'customer cannot read another customer order');
+}
+
+function testAdminCannotAddToCart(): void
+{
+    $_SESSION['admin_logged_in'] = true;
+    $_SESSION['customer_role'] = 'admin';
+    $blocked = !storefrontMayAddToCart(['id' => 1, 'role' => 'admin']);
+    unset($_SESSION['admin_logged_in'], $_SESSION['customer_role']);
+    check($blocked, 'admin cannot add to cart');
+}
+
+function testBankWebhookMarksPaid(mysqli $conn): void
+{
+    $product = $conn->query('SELECT p.id, p.base_price
+                             FROM products p
+                             INNER JOIN inventory_items ii ON ii.product_id = p.id
+                             WHERE p.is_active = 1 AND ii.quantity_on_hand > 0
+                             ORDER BY p.id ASC LIMIT 1')->fetch_assoc();
+    $shipping = $conn->query('SELECT id, fee FROM shipping_methods WHERE is_active = 1 ORDER BY id ASC LIMIT 1')->fetch_assoc();
+    $payment = $conn->query("SELECT id FROM payment_methods WHERE code IN ('bank_transfer','vietqr') AND is_active = 1 ORDER BY id ASC LIMIT 1")->fetch_assoc();
+    if (!$product || !$shipping || !$payment) {
+        check(false, 'bank webhook fixtures');
+        return;
+    }
+    $price = (int) round((float) $product['base_price']);
+    $total = $price + (int) $shipping['fee'];
+    $code = orderCreateFromCheckout(
+        $conn,
+        [
+            'name' => 'Webhook Buyer',
+            'phone' => '0900000008',
+            'email' => 'webhook@example.com',
+            'address' => 'Ha Noi',
+            'note' => '',
+        ],
+        [[
+            'product_id' => (int) $product['id'],
+            'sku' => 'TEST',
+            'name' => 'Test lamp',
+            'image' => 'assets/images/blog_1.png',
+            'price' => $price,
+            'qty' => 1,
+        ]],
+        ['subtotal' => $price, 'shipping' => (int) $shipping['fee'], 'discount' => 0, 'total' => $total],
+        null,
+        null,
+        (int) $shipping['id'],
+        (int) $payment['id'],
+        null
+    );
+
+    $disabled = paymentWebhookApply($conn, [
+        'id' => 'evt-disabled',
+        'transferType' => 'in',
+        'transferAmount' => $total,
+        'content' => 'Thanh toan ' . $code,
+    ], 'secret', '');
+    check($disabled['status'] === 'disabled', 'webhook disabled without token');
+
+    $unauthorized = paymentWebhookApply($conn, [
+        'id' => 'evt-unauth',
+        'transferType' => 'in',
+        'transferAmount' => $total,
+        'content' => 'Thanh toan ' . $code,
+    ], 'sai-token', 'secret-token');
+    check($unauthorized['http'] === 401, 'webhook rejects bad token');
+
+    $wrongAmount = paymentWebhookApply($conn, [
+        'id' => 'evt-wrong-amount',
+        'transferType' => 'in',
+        'transferAmount' => $total + 1,
+        'content' => 'Thanh toan ' . $code,
+    ], 'secret-token', 'secret-token');
+    check($wrongAmount['status'] === 'unmatched', 'webhook rejects wrong amount');
+
+    $eventId = 'evt-paid-' . bin2hex(random_bytes(4));
+    $paid = paymentWebhookApply($conn, [
+        'id' => $eventId,
+        'transferType' => 'in',
+        'transferAmount' => $total,
+        'content' => 'CK ' . $code . ' Winsum',
+    ], 'secret-token', 'secret-token');
+    $row = $conn->query("SELECT payment_status FROM orders WHERE order_code = '" . $conn->real_escape_string($code) . "'")->fetch_assoc();
+    check($paid['ok'] && $paid['status'] === 'paid' && ($row['payment_status'] ?? '') === 'paid', 'webhook marks matching transfer paid');
+
+    $duplicate = paymentWebhookApply($conn, [
+        'id' => $eventId,
+        'transferType' => 'in',
+        'transferAmount' => $total,
+        'content' => 'CK ' . $code . ' Winsum',
+    ], 'secret-token', 'secret-token');
+    check($duplicate['status'] === 'duplicate', 'webhook is idempotent');
+}
+
+function testProfileRequiresEmailWhenMissing(mysqli $conn): void
+{
+    $phone = '0900000776';
+    $conn->query("DELETE FROM customers WHERE phone = '" . $conn->real_escape_string($phone) . "'");
+    $created = customerRegister($conn, 'Need Email', $phone, '', 'cu-mat-khau');
+    $customerId = (int) ($created['customer_id'] ?? 0);
+    $blocked = customerUpdateProfile($conn, $customerId, 'Need Email', $phone, '', '');
+    $stillEmpty = $conn->query("SELECT email FROM customers WHERE id = " . $customerId)->fetch_assoc();
+    $saved = customerUpdateProfile($conn, $customerId, 'Need Email', $phone, 'need-email@example.com', '');
+    $row = $conn->query("SELECT email FROM customers WHERE id = " . $customerId)->fetch_assoc();
+    check(
+        $created['ok'] === true
+        && $blocked['ok'] === false
+        && trim((string) ($stillEmpty['email'] ?? '')) === ''
+        && $saved['ok'] === true
+        && (string) ($row['email'] ?? '') === 'need-email@example.com',
+        'account without email must save an email in the profile'
+    );
+    customerLogout();
+}
+
+function testCustomerPasswordReset(mysqli $conn): void
+{
+    $phone = '0900000777';
+    $conn->query("DELETE FROM customers WHERE phone = '" . $conn->real_escape_string($phone) . "'");
+    $created = customerRegister($conn, 'Reset Buyer', $phone, 'reset-buyer@example.com', 'cu-mat-khau');
+    check($created['ok'] === true, 'reset fixture account is created');
+
+    $missing = customerResetPassword($conn, '0900000888');
+    check($missing['ok'] === false && $missing['password'] === '', 'unknown account is not reset');
+
+    $admin = $conn->query("SELECT phone FROM customers WHERE role = 'admin' LIMIT 1")->fetch_assoc();
+    $adminPhone = (string) ($admin['phone'] ?? '');
+    $adminBefore = $conn->query("SELECT password_hash FROM customers WHERE phone = '" . $conn->real_escape_string($adminPhone) . "'")->fetch_assoc();
+    $adminReset = customerResetPassword($conn, $adminPhone);
+    $adminAfter = $conn->query("SELECT password_hash FROM customers WHERE phone = '" . $conn->real_escape_string($adminPhone) . "'")->fetch_assoc();
+    check($adminReset['ok'] === false && ($adminBefore['password_hash'] ?? '') === ($adminAfter['password_hash'] ?? ''), 'admin password is not reset from the public form');
+
+    $noMailPhone = '0900000778';
+    $conn->query("DELETE FROM customers WHERE phone = '" . $conn->real_escape_string($noMailPhone) . "'");
+    $noMailCreated = customerRegister($conn, 'No Mail Buyer', $noMailPhone, '', 'cu-mat-khau');
+    $noMailBefore = $conn->query("SELECT password_hash FROM customers WHERE phone = '" . $conn->real_escape_string($noMailPhone) . "'")->fetch_assoc();
+    $noMailReset = customerResetPassword($conn, $noMailPhone);
+    $noMailAfter = $conn->query("SELECT password_hash FROM customers WHERE phone = '" . $conn->real_escape_string($noMailPhone) . "'")->fetch_assoc();
+    check($noMailCreated['ok'] === true && $noMailReset['ok'] === false && ($noMailBefore['password_hash'] ?? '') === ($noMailAfter['password_hash'] ?? ''), 'account without email is not reset');
+    customerLogout();
+
+    $reset = customerResetPassword($conn, $phone);
+    $row = $conn->query("SELECT id, password_hash, must_change_password FROM customers WHERE phone = '" . $conn->real_escape_string($phone) . "'")->fetch_assoc();
+    $mailedPassword = '';
+    $mailFiles = glob(dirname(__DIR__) . '/storage/mail/*.txt') ?: [];
+    usort($mailFiles, static fn (string $a, string $b): int => filemtime($b) <=> filemtime($a));
+    foreach ($mailFiles as $mailFile) {
+        $contents = (string) file_get_contents($mailFile);
+        if (!str_contains($contents, 'reset-buyer@example.com')) {
+            continue;
+        }
+        if (preg_match('/Mật khẩu tạm thời: (\S+)/u', $contents, $matches) === 1) {
+            $mailedPassword = $matches[1];
+        }
+        break;
+    }
+    $login = $mailedPassword !== '' ? customerLogin($conn, $phone, $mailedPassword) : ['ok' => false];
+    $customerId = (int) ($row['id'] ?? 0);
+    $keptTemp = customerUpdateProfile($conn, $customerId, 'Reset Buyer', $phone, 'reset-buyer@example.com', '');
+    $sameTemp = customerUpdateProfile($conn, $customerId, 'Reset Buyer', $phone, 'reset-buyer@example.com', $mailedPassword);
+    $changed = customerUpdateProfile($conn, $customerId, 'Reset Buyer', $phone, 'reset-buyer@example.com', 'mat-khau-moi-2');
+    $after = $conn->query("SELECT password_hash, must_change_password FROM customers WHERE id = " . $customerId)->fetch_assoc();
+    check(
+        $reset['ok'] === true
+        && $reset['password'] === ''
+        && $mailedPassword !== ''
+        && (int) ($row['must_change_password'] ?? 0) === 1
+        && password_verify($mailedPassword, (string) ($row['password_hash'] ?? ''))
+        && $login['ok'] === true
+        && !empty($login['must_change_password'])
+        && $keptTemp['ok'] === false
+        && $sameTemp['ok'] === false
+        && $changed['ok'] === true
+        && (int) ($after['must_change_password'] ?? 1) === 0
+        && password_verify('mat-khau-moi-2', (string) ($after['password_hash'] ?? '')),
+        'customer must replace the temporary password after login'
+    );
+    customerLogout();
+}
+
+testCustomerPasswordReset($conn);
+testProfileRequiresEmailWhenMissing($conn);
+testOrderFlow($conn);
+testCouponExhausted($conn);
+testOrderOwnership($conn);
+testAdminCannotAddToCart();
+testBankWebhookMarksPaid($conn);
+
+if ($failures > 0) {
+    fwrite(STDERR, "{$failures} test(s) failed\n");
+    exit(1);
+}
+
+echo "All tests passed\n";
